@@ -4,15 +4,20 @@ import { AudioEngine } from './audio/AudioEngine';
 import type { StepVoice, WeatherKind } from './audio/AudioEngine';
 import { MicRecorder } from './audio/MicRecorder';
 import { Fragment } from './world/Fragment';
+import type { VoiceAudio } from './world/Fragment';
 import { NoteField } from './world/Notes';
 import { Weather } from './world/Weather';
 import { Panel } from './ui/Panel';
+import { Portfolio } from './data/Portfolio';
+import type { FragmentDoc, SongDoc } from './data/Portfolio';
+import { bytesToBase64, base64ToBytes, QuotaError } from './data/Portfolio';
 
 const SCALE = [261.63, 293.66, 329.63, 392.0, 440.0, 523.25, 587.33, 659.25];
 const SOLFEGE = ['do', 're', 'mi', 'sol', 'la', 'do', 're', 'mi'];
 const COLORS = ['#ff8a80', '#ffd180', '#ffff8d', '#ccff90', '#80d8ff', '#8c9eff', '#ea80fc', '#a7ffeb'];
 const TIMBRES: Array<'sine' | 'triangle' | 'square'> = ['sine', 'triangle', 'square'];
 const SLOT_COUNT = 6;
+const VOICE_COLOR = '#ffab40';
 const WEATHER_CYCLE: WeatherKind[] = ['sunny', 'rain', 'wind'];
 const WEATHER_AUTO_MS = 75_000;
 
@@ -37,6 +42,8 @@ export class Game {
   private panel!: Panel;
   private weather = new Weather();
   private notes = new NoteField(SLOT_COUNT, SCALE);
+  private portfolio = new Portfolio();
+  private currentSongId: string | null = null;
   private fragments: Fragment[] = [];
   private slots: (Fragment | null)[] = Array(SLOT_COUNT).fill(null);
   private engine = Matter.Engine.create({ gravity: { x: 0, y: 0.35, scale: 0.001 } });
@@ -52,6 +59,8 @@ export class Game {
   private pulseAt = 0;
   private celebrating = false;
   private micTimer: number | null = null;
+  /** 打开作品时正在异步解码录音，期间忽略重复打开/录音，避免河流状态竞争 */
+  private restoring = false;
 
   sketch = (p: p5): void => {
     p.setup = () => this.setup(p);
@@ -68,7 +77,15 @@ export class Game {
 
     for (let i = 0; i < SCALE.length; i++) {
       const frag = new Fragment(
-        { freq: SCALE[i], timbre: TIMBRES[i % TIMBRES.length], color: COLORS[i], label: SOLFEGE[i] },
+        {
+          id: this.toneId(i),
+          kind: 'tone',
+          toneIndex: i,
+          freq: SCALE[i],
+          timbre: TIMBRES[i % TIMBRES.length],
+          color: COLORS[i],
+          label: SOLFEGE[i],
+        },
         (i + 0.5) * (p.width / SCALE.length),
         this.surfaceY() + 20
       );
@@ -99,8 +116,12 @@ export class Game {
       onMic: () => void this.toggleMic(),
       onMute: (m) => this.audio.setMuted(m),
       onAnyGesture: () => void this.audio.unlock(),
+      onSaveSong: (name, asNew) => this.saveSong(name, asNew),
+      onOpenSong: (id) => void this.openSong(id),
+      onDeleteSong: (id) => this.deleteSong(id),
     });
     this.panel.setNotes(0, SLOT_COUNT);
+    this.refreshSongList();
 
     const canvas = this.canvasEl;
     canvas.style.touchAction = 'none';
@@ -278,7 +299,7 @@ export class Game {
     return { freq: frag.spec.freq, timbre: frag.spec.timbre, buffer: frag.spec.buffer ?? null };
   }
 
-  private placeInSlot(frag: Fragment, i: number): void {
+  private placeInSlot(frag: Fragment, i: number, silent = false): void {
     const occupant = this.slots[i];
     if (occupant && occupant !== frag) {
       this.unslot(occupant, frag.body.position.x, frag.body.position.y);
@@ -289,7 +310,7 @@ export class Game {
     Matter.Composite.remove(this.engine.world, frag.body);
     frag.slotIndex = i;
     this.slots[i] = frag;
-    this.audio.pluckNow(frag.spec.freq * 2);
+    if (!silent) this.audio.pluckNow(frag.spec.freq * 2);
   }
 
   private unslot(frag: Fragment, x?: number, y?: number): void {
@@ -402,6 +423,10 @@ export class Game {
       await this.stopMic();
       return;
     }
+    if (this.restoring) {
+      this.panel.toast('正在打开作品，稍等一下再录 ⏳');
+      return;
+    }
     try {
       await this.audio.unlock();
       await this.mic.start();
@@ -423,9 +448,21 @@ export class Game {
     const blob = await this.mic.stop();
     this.panel.setMicRecording(false);
     try {
-      const buffer = await this.audio.decode(await blob.arrayBuffer());
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      const buffer = await this.audio.decode(bytes.slice().buffer);
+      const voice: VoiceAudio = { bytes, mime: blob.type || 'audio/webm', buffer };
       const frag = new Fragment(
-        { freq: 261.63, timbre: 'sample', color: '#ffab40', label: '🎙️', buffer },
+        {
+          id: `voice-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+          kind: 'voice',
+          toneIndex: -1,
+          freq: 261.63,
+          timbre: 'sample',
+          color: VOICE_COLOR,
+          label: '🎙️',
+          buffer,
+          audio: voice,
+        },
         this.p.width / 2,
         this.surfaceY() + 8
       );
@@ -445,6 +482,203 @@ export class Game {
     this.audio.setWeather(w);
     this.panel.setWeatherActive(w);
     this.lastWeatherSwitch = this.p.millis();
+  }
+
+  // ---------- 本地作品集 ----------
+
+  private toneId(i: number): string {
+    return `tone-${i}`;
+  }
+
+  private refreshSongList(): void {
+    this.panel.setSongs(this.portfolio.list(), this.currentSongId);
+  }
+
+  /** 把当前画面序列化成存档：格子顺序、空格、全部碎片（含录音）、流速、水位、天气 */
+  private serializeSong(name: string, id: string, now: number): SongDoc {
+    const fragments: FragmentDoc[] = this.fragments.map((f) => {
+      const s = f.spec;
+      const doc: FragmentDoc = {
+        id: s.id,
+        kind: s.kind,
+        freq: s.freq,
+        timbre: s.timbre,
+        color: s.color,
+        label: s.label,
+        toneIndex: s.toneIndex,
+      };
+      if (s.kind === 'voice' && s.audio) {
+        doc.audio = bytesToBase64(s.audio.bytes);
+        doc.audioMime = s.audio.mime;
+      }
+      return doc;
+    });
+    return {
+      id,
+      name,
+      createdAt: now,
+      updatedAt: now,
+      flow: this.flow,
+      level: this.level,
+      weather: this.weatherKind,
+      slotCount: SLOT_COUNT,
+      slots: this.slots.map((f) => (f ? f.id : null)),
+      fragments,
+      version: 1,
+    };
+  }
+
+  private saveSong(name: string, asNew: boolean): void {
+    const now = Date.now();
+    // 覆盖当前作品沿用原 id 与创建时间；另存为或首次保存则新建
+    const existing = this.currentSongId && !asNew ? this.portfolio.get(this.currentSongId) : null;
+    const id = existing ? existing.id : Portfolio.newId();
+    const doc = this.serializeSong(name, id, now);
+    if (existing) doc.createdAt = existing.createdAt;
+    try {
+      this.portfolio.save(doc);
+      this.currentSongId = id;
+      this.refreshSongList();
+      this.panel.toast(existing ? `已保存《${name}》💾` : `《${name}》收进作品集啦！📚`);
+    } catch (e) {
+      if (e instanceof QuotaError) this.panel.toast(e.message);
+      else this.panel.toast('保存失败 😢 浏览器可能禁用了本地存储');
+    }
+  }
+
+  private async openSong(id: string): Promise<void> {
+    if (this.restoring) return;
+    const doc = this.portfolio.get(id);
+    if (!doc) {
+      this.refreshSongList();
+      return;
+    }
+    this.restoring = true;
+    // 录音是用户手势（点击）触发的：趁机解锁音频，保证 decodeAudioData 可用
+    await this.audio.unlock();
+    try {
+      await this.restoreSong(doc);
+      this.currentSongId = id;
+      this.refreshSongList();
+      this.panel.toast(`打开《${doc.name}》♪`);
+    } catch {
+      this.panel.toast('这首歌打不开了 😢（录音数据可能损坏）');
+    } finally {
+      this.restoring = false;
+    }
+  }
+
+  private deleteSong(id: string): void {
+    this.portfolio.remove(id);
+    if (this.currentSongId === id) this.currentSongId = null;
+    this.refreshSongList();
+    this.panel.toast('已删除 🗑️');
+  }
+
+  /** 按存档重建整条河流：还原因速/水位 → 清场 → 建碎片 → 摆格子 → 天气 */
+  private async restoreSong(doc: SongDoc): Promise<void> {
+    const p = this.p;
+    this.drags.clear();
+
+    // 先恢复水位（决定河面高度），碎片初始位置才会落在正确的水里
+    this.flow = doc.flow;
+    this.level = doc.level;
+    this.audio.setFlow(this.flow);
+    this.audio.setLevel(this.level);
+    this.panel.setFlow(this.flow);
+    this.panel.setLevel(this.level);
+
+    // 清掉旧碎片的物理体
+    for (const f of this.fragments) Matter.Composite.remove(this.engine.world, f.body);
+    this.fragments = [];
+    this.slots = Array(SLOT_COUNT).fill(null);
+
+    // 解码全部录音（AudioBuffer 无法直接 JSON 化，只持久化了编码字节）
+    const restored: Fragment[] = [];
+    for (const fd of doc.fragments) {
+      let voice: VoiceAudio | null = null;
+      if (fd.kind === 'voice') {
+        if (!fd.audio) continue;
+        const bytes = base64ToBytes(fd.audio);
+        const buffer = await this.audio.decode(bytes.slice().buffer);
+        voice = { bytes, mime: fd.audioMime || 'audio/webm', buffer };
+      }
+      const spec =
+        fd.kind === 'tone' && fd.toneIndex >= 0 && fd.toneIndex < SCALE.length
+          ? {
+              // 内置音符以音阶表为准，忽略存档里被改动的视觉/音高字段
+              id: this.toneId(fd.toneIndex),
+              kind: 'tone' as const,
+              toneIndex: fd.toneIndex,
+              freq: SCALE[fd.toneIndex],
+              timbre: TIMBRES[fd.toneIndex % TIMBRES.length],
+              color: COLORS[fd.toneIndex],
+              label: SOLFEGE[fd.toneIndex],
+            }
+          : {
+              id: fd.id,
+              kind: 'voice' as const,
+              toneIndex: -1,
+              freq: fd.freq || 261.63,
+              timbre: 'sample' as const,
+              color: fd.color || VOICE_COLOR,
+              label: fd.label || '🎙️',
+              buffer: voice?.buffer ?? null,
+              audio: voice,
+            };
+      // 先都放在河面，稍后把属于格子的静默移入格子
+      const x = ((restored.length + 0.5) / Math.max(doc.fragments.length, 1)) * p.width;
+      restored.push(new Fragment(spec, x, this.surfaceY() + 20));
+    }
+
+    // 存档若缺内置音符（旧版本/异常数据），补齐 8 块固定音阶
+    for (let i = 0; i < SCALE.length; i++) {
+      if (!restored.some((f) => f.id === this.toneId(i))) {
+        restored.push(
+          new Fragment(
+            {
+              id: this.toneId(i),
+              kind: 'tone',
+              toneIndex: i,
+              freq: SCALE[i],
+              timbre: TIMBRES[i % TIMBRES.length],
+              color: COLORS[i],
+              label: SOLFEGE[i],
+            },
+            (i + 0.5) * (p.width / SCALE.length),
+            this.surfaceY() + 20
+          )
+        );
+      }
+    }
+
+    for (const f of restored) Matter.Composite.add(this.engine.world, f.body);
+    this.fragments = restored;
+    const byId = new Map(restored.map((f) => [f.id, f]));
+
+    // 恢复格子顺序与空格：按存档逐格摆放，引用不到的格子留空
+    this.slots = Array(SLOT_COUNT).fill(null);
+    const slotCount = doc.slotCount || SLOT_COUNT;
+    for (let i = 0; i < SLOT_COUNT; i++) {
+      const fid = i < slotCount ? doc.slots[i] ?? null : null;
+      const frag = fid ? byId.get(fid) : null;
+      if (frag) this.placeInSlot(frag, i, true);
+    }
+    // 多块录音落在同一格等异常情况下，保证每条声音都还在河里，不会无声消失
+    for (const f of restored) {
+      if (f.slotIndex !== null && !this.slots.includes(f)) {
+        f.slotIndex = null;
+        Matter.Composite.add(this.engine.world, f.body);
+      }
+    }
+
+    // 恢复天气（同步粒子、环境声与面板高亮，并重置待机轮换计时）
+    this.setWeather(doc.weather);
+
+    // 收集进度不属于某首歌：重置一轮，避免 HUD 数字与画面音符对不上
+    this.collected = 0;
+    this.panel.setNotes(0, SLOT_COUNT);
+    this.notes.layout(p.width, p.height);
   }
 
   // ---------- 渲染 ----------

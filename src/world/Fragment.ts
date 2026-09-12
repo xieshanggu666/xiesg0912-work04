@@ -2,12 +2,25 @@ import type p5 from 'p5';
 import Matter from 'matter-js';
 import type { Timbre } from '../audio/AudioEngine';
 
+/** 孩子录下的声音：原始编码字节（用于存档）+ 解码后的缓冲（用于发声/画波形） */
+export interface VoiceAudio {
+  bytes: Uint8Array;
+  mime: string;
+  buffer: AudioBuffer;
+}
+
 export interface FragmentSpec {
+  /** 稳定身份：存档的格子顺序与碎片列表都靠它引用 */
+  id: string;
+  kind: 'tone' | 'voice';
   freq: number;
   timbre: Timbre;
   color: string;
   label: string;
+  /** tone 碎片在固定音阶中的序号；voice 为 -1 */
+  toneIndex: number;
   buffer?: AudioBuffer | null;
+  audio?: VoiceAudio | null;
 }
 
 const PEAK_COUNT = 28;
@@ -32,6 +45,15 @@ export class Fragment {
       chamfer: { radius: 12 },
     });
     this.peaks = spec.buffer ? this.peaksFromBuffer(spec.buffer) : this.peaksFromFreq(spec.freq);
+  }
+
+  get id(): string {
+    return this.spec.id;
+  }
+
+  /** 替换录音（当前未使用存档热替换，保留给扩展） */
+  get voiceAudio(): VoiceAudio | null {
+    return this.spec.audio ?? null;
   }
 
   draw(p: p5, x: number, y: number, angle: number, scale = 1): void {
