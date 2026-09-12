@@ -42,8 +42,19 @@ export interface SongSummary {
 
 const STORAGE_KEY = 'river-songs-v1';
 const DOC_VERSION = 1 as const;
-/** localStorage 常见每源上限约 5MB，留余量给其它数据 */
+/**
+ * localStorage 常见每源上限约 5MB，留余量给其它数据。
+ * 注意单位是 UTF-8 字节，不是字符串的 length（UTF-16 码元数）：
+ * 作品名里的中文每字占 3 字节、emoji 占 4 字节，按 length 估算会偏小。
+ */
 const MAX_TOTAL_BYTES = 4_500_000;
+
+const utf8Encoder = new TextEncoder();
+
+/** 字符串写入 localStorage 后占用的实际字节数（按 UTF-8 编码） */
+export function utf8ByteSize(s: string): number {
+  return utf8Encoder.encode(s).length;
+}
 
 /* ---------- base64：二进制录音 ↔ 字符串（DataURL 拆包，不走 atob 的中文坑） ---------- */
 
@@ -210,11 +221,16 @@ export class Portfolio {
     else docs.unshift(full);
 
     const json = JSON.stringify(docs);
-    if (json.length > MAX_TOTAL_BYTES) throw new QuotaError('作品集空间快满了');
+    // 浏览器按 UTF-8 字节计算 localStorage 配额，不能用 json.length（UTF-16 码元）：
+    // 中文名/emoji 与接近上限的录音会让实际占用明显大于字符数，预检会误放行。
+    const bytes = utf8ByteSize(json);
+    if (bytes > MAX_TOTAL_BYTES) {
+      throw new QuotaError(`作品集空间快满了（约 ${(bytes / 1_000_000).toFixed(1)}MB），先删掉一些旧作品再存`);
+    }
     try {
       writeStore(docs);
     } catch (e) {
-      // 多数浏览器配额超限时抛 QuotaExceededError
+      // 预检通过仍可能失败：这台设备/浏览器的实际配额更小，或已被同域其它数据占用
       throw new QuotaError('存不下啦：录音太多，浏览器本地空间不足', e);
     }
     return full;
