@@ -63,13 +63,116 @@ export function base64ToBytes(b64: string): Uint8Array {
   return out;
 }
 
+/* ---------- 存档读取与校验 ----------
+ * localStorage 可能被旧版本、手动编辑、写入中断等污染：顶层不是数组、
+ * 条目缺字段、fragments 缺失/不是数组/混入 null、时间戳是字符串等。
+ * 必须在读取边界逐条规范化，否则 list() 里 d.fragments.filter(...) 会抛
+ * TypeError，而列表在应用启动（p5 setup）时就要渲染，整个装置会白屏崩溃。
+ */
+
+const WEATHERS: readonly WeatherKind[] = ['sunny', 'rain', 'wind'];
+const TIMBRES: readonly Timbre[] = ['sine', 'triangle', 'square', 'sample'];
+const TONE_COUNT = 8; // Game 中固定音阶长度
+const MAX_SLOT_COUNT = 64;
+
+const isRecord = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v);
+
+const asNum = (v: unknown, fallback: number): number =>
+  typeof v === 'number' && Number.isFinite(v) ? v : fallback;
+
+/** 0~1 的滑块值：越界截断，非数字用默认值 */
+const asUnit = (v: unknown, fallback: number): number => {
+  const n = asNum(v, fallback);
+  return n < 0 ? 0 : n > 1 ? 1 : n;
+};
+
+/** 时间戳：必须是正数，无法解析时回落到当前时间，保证排序不出 NaN */
+const asTimestamp = (v: unknown): number => {
+  const n = asNum(v, NaN);
+  return n > 0 ? n : Date.now();
+};
+
+const normalizeFragment = (raw: unknown): FragmentDoc | null => {
+  if (!isRecord(raw)) return null;
+  if (typeof raw.id !== 'string' || raw.id === '') return null;
+
+  const kind = raw.kind === 'voice' ? 'voice' : raw.kind === 'tone' ? 'tone' : null;
+  if (!kind) return null;
+
+  const toneIndex = asNum(raw.toneIndex, -1);
+  // 内置音符若音阶序号越界则丢弃（恢复时会按音阶表自动补齐）
+  if (kind === 'tone' && (toneIndex < 0 || toneIndex >= TONE_COUNT)) return null;
+  // 录音碎片若音频载荷不是非空字符串，没有任何可恢复内容，丢弃
+  if (kind === 'voice' && !(typeof raw.audio === 'string' && raw.audio.length > 0)) return null;
+
+  const timbreRaw = raw.timbre;
+  const timbre: Timbre = TIMBRES.includes(timbreRaw as Timbre)
+    ? (timbreRaw as Timbre)
+    : kind === 'voice'
+      ? 'sample'
+      : 'sine';
+
+  return {
+    id: raw.id,
+    kind,
+    freq: asNum(raw.freq, 261.63),
+    timbre,
+    color: typeof raw.color === 'string' ? raw.color : '',
+    label: typeof raw.label === 'string' ? raw.label : '',
+    toneIndex,
+    ...(kind === 'voice'
+      ? { audio: raw.audio as string, audioMime: typeof raw.audioMime === 'string' ? raw.audioMime : 'audio/webm' }
+      : {}),
+  };
+};
+
+const normalizeDoc = (raw: unknown): SongDoc | null => {
+  if (!isRecord(raw)) return null;
+  if (typeof raw.id !== 'string' || raw.id === '') return null;
+  if (typeof raw.name !== 'string' || raw.name.trim() === '') return null;
+
+  const fragsRaw = Array.isArray(raw.fragments) ? raw.fragments : [];
+  const fragments = fragsRaw.map(normalizeFragment).filter((f): f is FragmentDoc => f !== null);
+
+  const slotsRaw = Array.isArray(raw.slots) ? raw.slots : [];
+  const slots: (string | null)[] = slotsRaw.map((s) =>
+    typeof s === 'string' && s !== '' ? s : null
+  );
+
+  const slotCountRaw = asNum(raw.slotCount, slots.length);
+  const slotCount = Math.max(0, Math.min(MAX_SLOT_COUNT, Math.round(slotCountRaw)));
+  if (slots.length < slotCount) slots.push(...Array(slotCount - slots.length).fill(null));
+  else if (slots.length > slotCount) slots.length = slotCount;
+
+  const weatherRaw = raw.weather;
+  const weather: WeatherKind = WEATHERS.includes(weatherRaw as WeatherKind)
+    ? (weatherRaw as WeatherKind)
+    : 'sunny';
+
+  return {
+    id: raw.id,
+    name: raw.name,
+    createdAt: asTimestamp(raw.createdAt),
+    updatedAt: asTimestamp(raw.updatedAt),
+    flow: asUnit(raw.flow, 0.4),
+    level: asUnit(raw.level, 0.5),
+    weather,
+    slotCount,
+    slots,
+    fragments,
+    version: 1,
+  };
+};
+
 function readStore(): SongDoc[] {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return [];
-    const parsed = JSON.parse(raw) as unknown;
+    const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter((d): d is SongDoc => !!d && typeof d === 'object' && 'id' in d && 'name' in d);
+    // 逐条校验：单条损坏只丢该条，不影响其余作品，更不能让整站启动失败
+    return parsed.map(normalizeDoc).filter((d): d is SongDoc => d !== null);
   } catch {
     return [];
   }
@@ -91,7 +194,7 @@ export class Portfolio {
         weather: d.weather,
         voiceCount: d.fragments.filter((f) => f.kind === 'voice').length,
       }))
-      .sort((a, b) => b.updatedAt - a.updatedAt);
+      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
   }
 
   get(id: string): SongDoc | null {

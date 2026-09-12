@@ -599,9 +599,14 @@ export class Game {
       let voice: VoiceAudio | null = null;
       if (fd.kind === 'voice') {
         if (!fd.audio) continue;
-        const bytes = base64ToBytes(fd.audio);
-        const buffer = await this.audio.decode(bytes.slice().buffer);
-        voice = { bytes, mime: fd.audioMime || 'audio/webm', buffer };
+        try {
+          const bytes = base64ToBytes(fd.audio);
+          const buffer = await this.audio.decode(bytes.slice().buffer);
+          voice = { bytes, mime: fd.audioMime || 'audio/webm', buffer };
+        } catch {
+          // 单条录音损坏（base64/编码无法解码）只跳过它，不影响整首歌恢复
+          continue;
+        }
       }
       const spec =
         fd.kind === 'tone' && fd.toneIndex >= 0 && fd.toneIndex < SCALE.length
